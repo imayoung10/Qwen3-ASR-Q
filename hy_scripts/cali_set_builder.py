@@ -632,6 +632,157 @@ def build_no_speech_records():
 
 
 # ──────────────────────────────────────────────
+# CalibrationDataLoader
+# ──────────────────────────────────────────────
+
+class CalibrationDataLoader:
+    """
+    calibration_metadata.json의 각 레코드에서 실제 오디오를 복원.
+
+    subset별 복원 방식:
+      librispeech  → HF LibriSpeech dataset, global_idx로 직접 접근
+      noisy        → LibriSpeech 원본을 꺼내 snr_db로 노이즈 재현
+      multilingual → HF FLEURS dataset, source_split에서 언어 코드 추출 후 접근
+      no_speech    → no_speech_type과 duration으로 오디오 재합성
+    """
+
+    def __init__(self):
+        self._ls_dataset = None
+        self._fleurs_cache: dict[str, object] = {}
+
+    # ── LibriSpeech 지연 로드 ──
+
+    def _get_ls_dataset(self):
+        if self._ls_dataset is None:
+            print("  Loading LibriSpeech (test.clean + test.other) ...")
+            ds_list = []
+            for split in LIBRISPEECH_SPLITS:
+                ds = load_dataset(
+                    "openslr/librispeech_asr", split=split, trust_remote_code=True
+                )
+                ds_list.append(ds)
+            self._ls_dataset = concatenate_datasets(ds_list)
+        return self._ls_dataset
+
+    # ── FLEURS 지연 로드 (언어별 캐시) ──
+
+    def _get_fleurs(self, lang_code: str):
+        if lang_code not in self._fleurs_cache:
+            print(f"  Loading FLEURS [{lang_code}] ...")
+            try:
+                ds = load_dataset(
+                    "google/fleurs", lang_code, split="test", trust_remote_code=True
+                )
+            except Exception:
+                ds = load_dataset(
+                    "google/fleurs", lang_code, split="validation", trust_remote_code=True
+                )
+            self._fleurs_cache[lang_code] = ds
+        return self._fleurs_cache[lang_code]
+
+    # ── no_speech 오디오 재합성 ──
+
+    @staticmethod
+    def _synthesize_no_speech(rec: dict) -> np.ndarray:
+        """
+        no_speech_type과 duration으로 오디오를 재합성.
+        WER 계산에서 어차피 skip되므로 정확한 재현보다 타입만 보존.
+        """
+        ns_type  = rec.get("no_speech_type", "silence")
+        duration = rec.get("duration", 1.0)
+        n_samp   = int(duration * TARGET_SR)
+        rng      = np.random.default_rng(abs(hash(rec["id"])) % (2 ** 32))
+
+        if ns_type == "silence":
+            return rng.uniform(-1e-4, 1e-4, n_samp).astype(np.float32)
+
+        elif ns_type == "gaussian_noise":
+            audio = rng.standard_normal(n_samp).astype(np.float32)
+            rms   = float(rng.uniform(0.01, 0.05))
+            return audio / (np.sqrt(np.mean(audio ** 2)) + 1e-12) * rms
+
+        elif ns_type == "bandlimited_noise":
+            white   = rng.standard_normal(n_samp).astype(np.float32)
+            fft_val = np.fft.rfft(white)
+            freqs   = np.fft.rfftfreq(n_samp, d=1.0 / TARGET_SR)
+            fft_val[~((freqs >= 4000) & (freqs <= 8000))] = 0.0
+            audio   = np.fft.irfft(fft_val, n=n_samp).astype(np.float32)
+            rms     = float(rng.uniform(0.01, 0.03))
+            return audio / (np.sqrt(np.mean(audio ** 2)) + 1e-12) * rms
+
+        return np.zeros(n_samp, dtype=np.float32)
+
+    # ── 공개 인터페이스 ──
+
+    def get_audio(self, rec: dict) -> np.ndarray:
+        """
+        레코드 하나를 받아 TARGET_SR(16kHz) numpy 오디오 배열을 반환.
+        모든 subset을 단일 인터페이스로 처리.
+        """
+        subset = rec["subset"]
+
+        # ── librispeech ──
+        if subset == "librispeech":
+            ds     = self._get_ls_dataset()
+            sample = ds[rec["global_idx"]]
+            audio  = np.array(sample["audio"]["array"], dtype=np.float32)
+            return resample_if_needed(audio, sample["audio"]["sampling_rate"])[0]
+
+        # ── noisy: LibriSpeech 원본 + snr_db로 노이즈 재현 ──
+        elif subset == "noisy":
+            ds = self._get_ls_dataset()
+
+            # source_id 포맷: "noisy_{original_sample_id}_{bucket}_{n}"
+            source_id = rec.get("source_id", "")
+            try:
+                raw_id = source_id.split("_")[1]
+                ds_idx = int(raw_id)
+                if ds_idx >= len(ds):
+                    raise ValueError(f"ds_idx {ds_idx} out of range")
+                sample = ds[ds_idx]
+            except Exception:
+                sample = ds[rec["global_idx"] % len(ds)]
+
+            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            audio = resample_if_needed(audio, sample["audio"]["sampling_rate"])[0]
+
+            snr_db = rec.get("snr_db")
+            if snr_db is not None:
+                rng   = np.random.default_rng(abs(hash(rec["id"])) % (2 ** 32))
+                audio = add_noise(audio, float(snr_db), rng)
+            return audio
+
+        # ── multilingual: FLEURS ──
+        elif subset == "multilingual":
+            # source_split 포맷: "fleurs_{lang_code}"  e.g. "fleurs_ko_kr"
+            lang_code = rec["source_split"].removeprefix("fleurs_")
+            ds        = self._get_fleurs(lang_code)
+
+            # sample_id 포맷: "fleurs_{lang_code}_{original_idx}"  e.g. "fleurs_ko_kr_42"
+            try:
+                orig_idx = int(rec["id"].split("_")[-1])
+                if orig_idx >= len(ds):
+                    raise ValueError
+                sample = ds[orig_idx]
+            except Exception:
+                sample = ds[0]
+
+            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            return resample_if_needed(audio, sample["audio"]["sampling_rate"])[0]
+
+        # ── no_speech: 재합성 ──
+        elif subset == "no_speech":
+            return self._synthesize_no_speech(rec)
+
+        else:
+            raise ValueError(f"Unknown subset: {subset!r}")
+
+    def __call__(self, rec: dict) -> tuple[np.ndarray, int]:
+        """(audio_array, sr) 형태로 반환 — 외부 호환용."""
+        return self.get_audio(rec), TARGET_SR
+
+
+# ──────────────────────────────────────────────
 # 저장 및 요약
 # ──────────────────────────────────────────────
 
@@ -711,7 +862,7 @@ def save_outputs(selected: list, out_dir: Path):
 # 실행
 # ──────────────────────────────────────────────
 
-def build_cali_set(
+def main(
     output_dir: str = "./calibration_set",
     seed: int = SEED,
 ):
