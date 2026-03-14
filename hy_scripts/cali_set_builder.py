@@ -711,7 +711,7 @@ def save_outputs(selected: list, out_dir: Path):
 # 실행
 # ──────────────────────────────────────────────
 
-def main(
+def build_cali_set(
     output_dir: str = "./calibration_set",
     seed: int = SEED,
 ):
