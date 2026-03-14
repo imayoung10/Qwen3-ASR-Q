@@ -10,15 +10,10 @@ from datasets import load_dataset, concatenate_datasets
 
 
 # ──────────────────────────────────────────────
-# 설정
+# 설정 (import 시점에 사이드이펙트 없음)
 # ──────────────────────────────────────────────
-OUTPUT_DIR = Path("./calibration_set")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
 TARGET_SR = 16000
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
+SEED      = 42
 
 # 총 512개 구성
 # LibriSpeech  : 300 (representative 220 + stress 80)
@@ -31,7 +26,6 @@ N_NOISY              = 125
 N_MULTILINGUAL       = 75
 N_NO_SPEECH          = 12
 N_TOTAL              = N_LIBRISPEECH_REPR + N_LIBRISPEECH_STRESS + N_NOISY + N_MULTILINGUAL + N_NO_SPEECH
-assert N_TOTAL == 512, f"총합 오류: {N_TOTAL}"
 
 # Noisy SNR 버킷: very_low(0~5dB) 40% / low(5~15dB) 35% / medium(15~20dB) 25%
 # 저SNR에 더 많이 배치 — W4A4에서 outlier가 극단 입력에서 집중 발생하기 때문
@@ -717,7 +711,34 @@ def save_outputs(selected: list, out_dir: Path):
 # 실행
 # ──────────────────────────────────────────────
 
-def main():
+def main(
+    output_dir: str = "./calibration_set",
+    seed: int = SEED,
+):
+    """
+    Calibration set을 빌드하고 output_dir에 저장.
+
+    Parameters
+    ----------
+    output_dir : str
+        결과물을 저장할 디렉토리 경로.
+    seed : int
+        재현성을 위한 랜덤 시드.
+
+    Example
+    -------
+    >>> from build_calibration_set import main
+    >>> main(output_dir="./my_calib", seed=42)
+    """
+    # 사이드이펙트를 main() 호출 시점으로 한정
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    assert N_TOTAL == 512, f"총합 오류: {N_TOTAL}"
+
     print("=" * 70)
     print(f"Target composition  total={N_TOTAL}")
     print(f"  LibriSpeech repr  : {N_LIBRISPEECH_REPR}")
@@ -729,6 +750,8 @@ def main():
     print(f"  Multilingual      : {N_MULTILINGUAL}  "
           f"({len(FLEURS_LANGUAGES)} langs × {N_PER_LANGUAGE})")
     print(f"  No-speech         : {N_NO_SPEECH}  (3 types × 4 durations)")
+    print(f"  output_dir        : {out_dir}")
+    print(f"  seed              : {seed}")
     print("=" * 70)
 
     # ── 1. LibriSpeech ──
@@ -763,9 +786,5 @@ def main():
         print(f"  Trimming {len(selected) - N_TOTAL} excess samples ...")
         selected = selected[:N_TOTAL]
 
-    save_outputs(selected, OUTPUT_DIR)
+    save_outputs(selected, out_dir)
     print("\nDone.")
-
-
-if __name__ == "__main__":
-    main()
